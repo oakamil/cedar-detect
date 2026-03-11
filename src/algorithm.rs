@@ -77,8 +77,8 @@
 //!   greater bit depth must be converted before calling
 //!   [get_stars_from_image()].
 //! * The imaging exposure time and sensor gain are usually chosen by the caller
-//!   to yield a desired number of faint star detections. In so doing, if a
-//!   bright star is overexposed to a degree that it bleeds into too many
+//!   to yield a desired number of faint star detections. In so doing, if a bright
+//!   star is overexposed to a degree that it bleeds into too many
 //!   adjacent pixels, CedarDetect will reject the bright star.
 //! * Pixel scale and focusing are crucial:
 //!   * If star images are too extended w.r.t. the pixel grid, CedarDetect might not
@@ -117,12 +117,12 @@
 //!   lens distortion corrections when doing astrometry (e.g. plate solving).
 
 use std::cmp;
-use std::collections::hash_map::HashMap;
 use std::time::Instant;
 
 use image::GrayImage;
 use imageproc::rect::Rect;
 use log::{debug};
+use rayon::prelude::*;
 
 use crate::histogram_funcs::{HistogramStats,
                              remove_stars_from_histogram,
@@ -136,58 +136,35 @@ fn compare_floats(a: &f64, b: &f64) -> std::cmp::Ordering {
     a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
 }
 
-// An iterator over the pixels of a region of interest. Yields pixels in raster
-// scan order.
-struct EnumeratePixels<'a> {
-    image: &'a GrayImage,
-    roi: &'a Rect,
-    include_interior: bool,
-
-    // Identifies the next pixel to be yielded. If cur_y is beyond the ROI's
-    // bottom, the iteration is finished.
-    cur_x: i32,
-    cur_y: i32,
-}
-
-impl<'a> EnumeratePixels<'a> {
-    // If include_interior is false, only the perimeter is enumerated.
-    fn new(image: &'a GrayImage, roi: &'a Rect, include_interior: bool)
-           -> EnumeratePixels<'a> {
-        let (width, height) = image.dimensions();
-        assert!(roi.left() >= 0);
-        assert!(roi.top() >= 0);
-        assert!(roi.right() < width as i32);
-        assert!(roi.bottom() < height as i32);
-        EnumeratePixels{image, roi, include_interior,
-                        cur_x: roi.left(), cur_y: roi.top()}
+// Inline iterators to replace branch-heavy `EnumeratePixels` logic
+#[inline(always)]
+fn process_perimeter<F: FnMut(i32, i32, u8)>(image: &GrayImage, roi: &Rect, mut f: F) {
+    let top = roi.top();
+    let bottom = roi.bottom();
+    let left = roi.left();
+    let right = roi.right();
+    if bottom < top || right < left { return; }
+    
+    for x in left..=right {
+        f(x, top, image.get_pixel(x as u32, top as u32).0[0]);
+        if bottom > top {
+            f(x, bottom, image.get_pixel(x as u32, bottom as u32).0[0]);
+        }
+    }
+    for y in top + 1..bottom {
+        f(left, y, image.get_pixel(left as u32, y as u32).0[0]);
+        if right > left {
+            f(right, y, image.get_pixel(right as u32, y as u32).0[0]);
+        }
     }
 }
 
-impl<'a> Iterator for EnumeratePixels<'a> {
-    type Item = (i32, i32, u8);  // x, y, pixel value.
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.cur_y > self.roi.bottom() {
-            return None;
+#[inline(always)]
+fn process_area<F: FnMut(i32, i32, u8)>(image: &GrayImage, roi: &Rect, mut f: F) {
+    for y in roi.top()..=roi.bottom() {
+        for x in roi.left()..=roi.right() {
+            f(x, y, image.get_pixel(x as u32, y as u32).0[0]);
         }
-        let item:Self::Item = (self.cur_x, self.cur_y,
-                               self.image.get_pixel(
-                                   self.cur_x as u32, self.cur_y as u32).0[0]);
-        if self.cur_x == self.roi.right() {
-            self.cur_x = self.roi.left();
-            self.cur_y += 1;
-        } else {
-            let do_all_in_row = self.include_interior ||
-                self.cur_y == self.roi.top() || self.cur_y == self.roi.bottom();
-            if do_all_in_row {
-                self.cur_x += 1;
-            } else {
-                // Exclude interior.
-                assert_eq!(self.cur_x, self.roi.left());
-                self.cur_x = self.roi.right();
-            }
-        }
-        Some(item)
     }
 }
 
@@ -359,22 +336,19 @@ fn scan_image_for_candidates(image: &GrayImage,
                              compute_histogram: bool)
                              -> (Vec<CandidateFrom1D>, Option<[u32; 256]>)
 {
-    let mut histogram = [0_u32; 256];
-
     let row_scan_start = Instant::now();
     let width = image.dimensions().0 as usize;
     let height = image.dimensions().1 as usize;
-    let image_pixels: &Vec<u8> = image.as_raw();
+    let image_pixels: &[u8] = image.as_raw();
 
     let sigma_noise_2 = cmp::max((2.0 * sigma * noise_estimate + 0.5) as i16, 2);
     let sigma_noise_3 = cmp::max((3.0 * sigma * noise_estimate + 0.5) as i16, 3);
 
-    let estimated_candidates = (width * height) / 10000;
-    let mut candidates = Vec::<CandidateFrom1D>::with_capacity(estimated_candidates);
-    for rownum in 0..height {
-        // Get the slice of image_pixels corresponding to this row.
-        let row_pixels: &[u8] = &image_pixels.as_slice()
-            [rownum * width .. (rownum+1) * width];
+    // Parallelize Candidate processing by chunks (each chunk maps to a row)
+    let results: Vec<(Vec<CandidateFrom1D>, [u32; 256])> = (0..height).into_par_iter().map(|rownum| {
+        let mut local_candidates = Vec::new();
+        let mut local_histogram = [0_u32; 256];
+        let row_pixels: &[u8] = &image_pixels[rownum * width .. (rownum+1) * width];
 
         // First pass: sample every cache line (64 bytes) to estimate row minimum.
         let mut row_min = 255u8;
@@ -387,14 +361,14 @@ fn scan_image_for_candidates(image: &GrayImage,
         if compute_histogram {
             for center_x in 3..(row_pixels.len()-3) {
                 let center_pixel = row_pixels[center_x];
-                histogram[center_pixel as usize] += 1;
+                local_histogram[center_pixel as usize] += 1;
                 if center_pixel >= threshold {
                     let gate = &row_pixels[center_x-3..center_x+4];
                     let result_type = gate_star_1d(
                         gate, sigma_noise_2, sigma_noise_3);
                     if result_type == ResultType::Candidate {
-                        candidates.push(CandidateFrom1D{x: center_x as i32,
-                                                        y: rownum as i32});
+                        local_candidates.push(CandidateFrom1D{x: center_x as i32,
+                                                              y: rownum as i32});
                     }
                 }
             }
@@ -407,17 +381,32 @@ fn scan_image_for_candidates(image: &GrayImage,
                     let result_type = gate_star_1d(
                         gate, sigma_noise_2, sigma_noise_3);
                     if result_type == ResultType::Candidate {
-                        candidates.push(CandidateFrom1D{x: center_x as i32,
-                                                        y: rownum as i32});
+                        local_candidates.push(CandidateFrom1D{x: center_x as i32,
+                                                              y: rownum as i32});
                     }
                 }
             }
         }
-    }  // Iterate over rows.
+        (local_candidates, local_histogram)
+    }).collect();
+
+    // Reduce Phase
+    let estimated_candidates = (width * height) / 10000;
+    let mut candidates = Vec::with_capacity(estimated_candidates);
+    let mut global_histogram = [0_u32; 256];
+
+    for (mut local_cands, local_hist) in results {
+        candidates.append(&mut local_cands);
+        if compute_histogram {
+            for i in 0..256 {
+                global_histogram[i] += local_hist[i];
+            }
+        }
+    }
 
     debug!("Image scan found {} candidates in {:?}",
            candidates.len(), row_scan_start.elapsed());
-    (candidates, if compute_histogram {Some(histogram)} else {None} )
+    (candidates, if compute_histogram {Some(global_histogram)} else {None} )
 }
 
 #[derive(Debug)]
@@ -448,14 +437,17 @@ fn form_blobs_from_candidates(candidates: Vec<CandidateFrom1D>, max_y: usize)
     let mut labeled_candidates_by_row =
         vec![Vec::<LabeledCandidate>::new(); max_y + 1];
 
-    let mut blobs: HashMap<usize, Blob> = HashMap::new();
+    // Replace HashMap mapping with flat Vec to bypass hashing overhead
+    let mut blobs: Vec<Blob> = Vec::with_capacity(candidates.len());
+    
     // Create an initial singular blob for each candidate.
     for (next_blob_id, candidate) in candidates.into_iter().enumerate() {
-        blobs.insert(next_blob_id, Blob{candidates: vec![candidate],
-                                        recipient_blob: None});
+        blobs.push(Blob{candidates: vec![candidate],
+                        recipient_blob: None});
         labeled_candidates_by_row[candidate.y as usize].push(
             LabeledCandidate{candidate, blob_id: next_blob_id});
     }
+    
     // Merge adjacent blobs. Within a row blobs are not adjacent (by the nature of
     // how row scanning identifies candidates), so we just need to look for vertical
     // adjacencies.
@@ -477,21 +469,18 @@ fn form_blobs_from_candidates(candidates: Vec<CandidateFrom1D>, max_y: usize)
                 // row blob's candidates.
                 let recipient_blob_id = rc.blob_id;
                 let mut donor_blob_id = prev_row_rc.blob_id;
-                let mut donated_candidates: Vec<CandidateFrom1D>;
                 loop {
-                    let donor_blob = blobs.get_mut(&donor_blob_id)
-                        .expect("donor_blob_id should always exist in blobs HashMap");
-                    if !donor_blob.candidates.is_empty() {
-                        donated_candidates = donor_blob.candidates.drain(..).collect();
-                        assert_eq!(donor_blob.recipient_blob, None);
-                        donor_blob.recipient_blob = Some(recipient_blob_id);
-                        let recipient_blob = &mut blobs.get_mut(&recipient_blob_id)
-                            .expect("recipient_blob_id should always exist in blobs HashMap");
-                        recipient_blob.candidates.append(&mut donated_candidates);
+                    // Safe draining block
+                    if !blobs[donor_blob_id].candidates.is_empty() {
+                        let mut donated_candidates: Vec<CandidateFrom1D> = blobs[donor_blob_id].candidates.drain(..).collect();
+                        assert_eq!(blobs[donor_blob_id].recipient_blob, None);
+                        blobs[donor_blob_id].recipient_blob = Some(recipient_blob_id);
+                        blobs[recipient_blob_id].candidates.append(&mut donated_candidates);
                         break;
                     }
+                    
                     // donor_blob's candidates got merged to another blob.
-                    let merged_blob_id = donor_blob.recipient_blob
+                    let merged_blob_id = blobs[donor_blob_id].recipient_blob
                         .expect("if candidates are empty, must have been merged");
                     if merged_blob_id == recipient_blob_id {
                         break;  // Already merged it.
@@ -501,13 +490,13 @@ fn form_blobs_from_candidates(candidates: Vec<CandidateFrom1D>, max_y: usize)
             }
         }
     }
+    
     // Return non-empty blobs. Note that the blob merging we just did will leave
-    // some empty entries in the `blobs` mapping.
+    // some empty entries.
     let mut non_empty_blobs = Vec::<Blob>::new();
-    for (_id, blob) in blobs {
+    for blob in blobs {
         if !blob.candidates.is_empty() {
             assert_eq!(blob.recipient_blob, None);
-            debug!("got blob {:?}", blob);
             non_empty_blobs.push(blob);
         }
     }
@@ -635,11 +624,10 @@ fn gate_star_2d(
     // Compute average of pixels in core.
     let mut core_sum: i32 = 0;
     let mut core_count: i32 = 0;
-    for (_x, _y, pixel_value) in EnumeratePixels::new(
-        image, &core, /*include_interior=*/true) {
+    process_area(image, &core, |_x, _y, pixel_value| {
         core_sum += i32::from(pixel_value);
         core_count += 1;
-    }
+    });
     let core_mean = core_sum as f64 / core_count as f64;
 
     if core_width >= 3 && core_height >= 3 {
@@ -651,11 +639,10 @@ fn gate_star_2d(
         // brightness criterion here for completeness.
         let mut outer_core_sum: i32 = 0;
         let mut outer_core_count: i32 = 0;
-        for (_x, _y, pixel_value) in EnumeratePixels::new(
-            image, &core, /*include_interior=*/false) {
+        process_perimeter(image, &core, |_x, _y, pixel_value| {
             outer_core_sum += i32::from(pixel_value);
             outer_core_count += 1;
-        }
+        });
         let outer_core_mean = outer_core_sum as f64 / outer_core_count as f64;
         // When including the inner core (core_mean), we should be at least as
         // bright as when excluding the inner core (outer_core_mean).
@@ -669,17 +656,15 @@ fn gate_star_2d(
     // Compute average of pixels in box immediately surrounding core.
     let mut neighbor_sum: i32 = 0;
     let mut neighbor_count: i32 = 0;
-    for (x, y, pixel_value) in EnumeratePixels::new(
-        image, &neighbors, /*include_interior=*/false) {
+    process_perimeter(image, &neighbors, |x, y, pixel_value| {
         let is_corner =
             (x == neighbors.left() || x == neighbors.right()) &&
             (y == neighbors.top() || y == neighbors.bottom());
-        if is_corner {
-            continue;  // Exclude corner pixels.
+        if !is_corner {
+            neighbor_sum += i32::from(pixel_value);
+            neighbor_count += 1;
         }
-        neighbor_sum += i32::from(pixel_value);
-        neighbor_count += 1;
-    }
+    });
     let neighbor_mean = neighbor_sum as f64 / neighbor_count as f64;
     // Core average must be at least as bright as the neighbor average.
     if core_mean < neighbor_mean {
@@ -692,11 +677,10 @@ fn gate_star_2d(
     // the outer perimeter.
     let mut margin_sum: i32 = 0;
     let mut margin_count: i32 = 0;
-    for (_x, _y, pixel_value) in EnumeratePixels::new(
-        image, &margin, /*include_interior=*/false) {
+    process_perimeter(image, &margin, |_x, _y, pixel_value| {
         margin_sum += i32::from(pixel_value);
         margin_count += 1;
-    }
+    });
     let margin_mean = margin_sum as f64 / margin_count as f64;
     if core_mean <= margin_mean {
         debug!("Core average {} is not greater than margin average {} for blob {:?}",
@@ -708,11 +692,10 @@ fn gate_star_2d(
     // background.
     let mut perimeter_sum: i32 = 0;
     let mut perimeter_count: i32 = 0;
-    let mut perimeter_min = image.get_pixel(perimeter.left() as u32,
-                                            perimeter.top() as u32).0[0];
+    let mut perimeter_min = image.get_pixel(perimeter.left() as u32, perimeter.top() as u32).0[0];
     let mut perimeter_max = perimeter_min;
-    for (_x, _y, pixel_value) in EnumeratePixels::new(
-        image, &perimeter, /*include_interior=*/false) {
+    
+    process_perimeter(image, &perimeter, |_x, _y, pixel_value| {
         perimeter_sum += i32::from(pixel_value);
         perimeter_count += 1;
         if pixel_value < perimeter_min {
@@ -720,7 +703,7 @@ fn gate_star_2d(
         } else if pixel_value > perimeter_max {
             perimeter_max = pixel_value;
         }
-    }
+    });
     let background_est = perimeter_sum as f64 / perimeter_count as f64;
     debug!("background: {} for blob {:?}", background_est, core);
 
@@ -728,11 +711,11 @@ fn gate_star_2d(
     // such as an illuminated foreground object, this noise estimate will be
     // high, suppressing spurious "star" detections.
     let mut perimeter_dev_2: f64 = 0.0;
-    for (_x, _y, pixel_value) in EnumeratePixels::new(
-        image, &perimeter, /*include_interior=*/false) {
+    process_perimeter(image, &perimeter, |_x, _y, pixel_value| {
         let res = i32::from(pixel_value) as f64 - background_est;
         perimeter_dev_2 += res * res;
-    }
+    });
+    
     let perimeter_stddev = (perimeter_dev_2 / perimeter_count as f64).sqrt();
     let max_noise_estimate = f64::max(noise_estimate, perimeter_stddev);
 
@@ -794,11 +777,10 @@ fn gate_star_2d(
 fn compute_brightness(image: &GrayImage, bounding_box: &Rect) -> (f64, u16, u8) {
     let mut boundary_sum: i32 = 0;
     let mut boundary_count: i32 = 0;
-    for (_x, _y, pixel_value) in EnumeratePixels::new(
-        image, bounding_box, /*include_interior=*/false) {
+    process_perimeter(image, bounding_box, |_x, _y, pixel_value| {
         boundary_sum += pixel_value as i32;
         boundary_count += 1;
-    }
+    });
     let background_est = boundary_sum as f64 / boundary_count as f64;
 
     let inset = Rect::at(bounding_box.left() + 1, bounding_box.top() + 1)
@@ -807,8 +789,7 @@ fn compute_brightness(image: &GrayImage, bounding_box: &Rect) -> (f64, u16, u8) 
     let mut num_saturated = 0;
     let mut sum = 0.0;
     let mut peak_value: u8 = 0;
-    for (_x, _y, pixel_value) in EnumeratePixels::new(
-        image, &inset, /*include_interior=*/true) {
+    process_area(image, &inset, |_x, _y, pixel_value| {
         if pixel_value == 255_u8 {
             num_saturated += 1;
         }
@@ -816,7 +797,8 @@ fn compute_brightness(image: &GrayImage, bounding_box: &Rect) -> (f64, u16, u8) 
             peak_value = pixel_value;
         }
         sum += pixel_value as f64 - background_est;
-    }
+    });
+    
     (f64::max(sum, 0.0), num_saturated, peak_value)
 }
 
@@ -826,11 +808,12 @@ fn compute_peak_coord(image: &GrayImage, bounding_box: &Rect) -> (f64, f64) {
     let mut vertical_projection = vec![0u32; bounding_box.height() as usize];
     let x0 = bounding_box.left();
     let y0 = bounding_box.top();
-    for (x, y, pixel_value) in EnumeratePixels::new(
-        image, bounding_box, /*include_interior=*/true) {
+    
+    process_area(image, bounding_box, |x, y, pixel_value| {
         horizontal_projection[(x - x0) as usize] += pixel_value as u32;
         vertical_projection[(y - y0) as usize] += pixel_value as u32;
-    }
+    });
+    
     let peak_x = x0 as f64 + peak_coord_1d(horizontal_projection);
     let peak_y = y0 as f64 + peak_coord_1d(vertical_projection);
     (peak_x, peak_y)
@@ -925,10 +908,9 @@ pub fn estimate_background_from_image_region(image: &GrayImage, roi: &Rect)
 // of the sky background.
 fn stats_for_roi(image: &GrayImage, roi: &Rect) -> HistogramStats {
     let mut histogram = [0_u32; 256];
-    for (_x, _y, pixel_value) in EnumeratePixels::new(
-        image, roi, /*include_interior=*/true) {
+    process_area(image, roi, |_x, _y, pixel_value| {
         histogram[pixel_value as usize] += 1;
-    }
+    });
     remove_stars_from_histogram(&mut histogram, /*sigma=*/8.0);
     stats_for_histogram(&histogram)
 }
@@ -1260,11 +1242,10 @@ pub fn summarize_region_of_interest(image: &GrayImage, roi: &Rect,
     let value_box = Rect::at(peak_x - 1, peak_y - 1).of_size(3, 3);
     let mut box_sum: i32 = 0;
     let mut box_count: i32 = 0;
-    for (_x, _y, pixel_value) in EnumeratePixels::new(
-        image, &value_box, /*include_interior=*/true) {
+    process_area(image, &value_box, |_x, _y, pixel_value| {
         box_sum += pixel_value as i32;
         box_count += 1;
-    }
+    });
     let peak_value = box_sum as f64 / box_count as f64;
 
     debug!("ROI processing completed in {:?}", process_roi_start.elapsed());
@@ -1279,61 +1260,6 @@ mod tests {
     use imageproc::gray_image;
     use imageproc::noise::gaussian_noise;
     use super::*;
-
-    #[test]
-    #[should_panic]
-    fn test_enumerate_pixels_roi_too_large() {
-        let empty_image = gray_image!();
-        let _iter = EnumeratePixels::new(
-            &empty_image,
-            &Rect::at(0, 0).of_size(1, 1),
-            /*include_interior*/false);
-    }
-
-    #[test]
-    fn test_enumerate_pixels_1x1() {
-        let image_1x1 = gray_image!(127);
-        let pixels: Vec<(i32, i32, u8)> =
-            EnumeratePixels::new(&image_1x1,
-                                 &Rect::at(0, 0).of_size(1, 1),
-                                 /*include_interior*/false).collect();
-        assert_eq!(pixels, vec!((0, 0, 127)));
-    }
-
-    #[test]
-    fn test_enumerate_pixels_3x3() {
-        let image_3x3 = gray_image!(
-            0, 1, 2;
-            127, 253, 254;
-            255, 0, 1);
-
-        // Entire ROI, with interior.
-        let mut pixels: Vec<(i32, i32, u8)> =
-            EnumeratePixels::new(&image_3x3,
-                                 &Rect::at(0, 0).of_size(3, 3),
-                                 /*include_interior*/true).collect();
-        assert_eq!(pixels, vec!((0, 0, 0),
-                                (1, 0, 1),
-                                (2, 0, 2),
-                                (0, 1, 127),
-                                (1, 1, 253),
-                                (2, 1, 254),
-                                (0, 2, 255),
-                                (1, 2, 0),
-                                (2, 2, 1)));
-        // Entire ROI, no interior.
-        pixels = EnumeratePixels::new(&image_3x3,
-                                      &Rect::at(0, 0).of_size(3, 3),
-                                      /*include_interior*/false).collect();
-        assert_eq!(pixels, vec!((0, 0, 0),
-                                (1, 0, 1),
-                                (2, 0, 2),
-                                (0, 1, 127),
-                                (2, 1, 254),
-                                (0, 2, 255),
-                                (1, 2, 0),
-                                (2, 2, 1)));
-    }
 
     #[test]
     fn test_stats_for_roi() {

@@ -18,6 +18,7 @@ log = "0.4.19"
 prctl = "1.0.0"
 prost = "0.12.3"
 prost-types = "0.12.3"
+rayon = "1.11.0"
 tokio = { version = "1.32.0", features = ["macros", "rt-multi-thread"] }
 tonic = "0.11"
 tonic-web = "0.11.0"
