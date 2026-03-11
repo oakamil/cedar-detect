@@ -44,21 +44,26 @@ fn bin_and_histogram_2x2_default(image: &GrayImage, normalize_rows: bool) -> Bin
     let mut resized_image = vec![0u8; (new_width * new_height) as usize];
     let row_pairs: Vec<u32> = (0..height & !1).step_by(2).collect();
 
-    // FIXED: Use par_chunks_exact_mut instead of chunks_exact_mut
     let histograms: Vec<[u32; 256]> = resized_image
         .par_chunks_exact_mut(new_width as usize)
         .zip(row_pairs.into_par_iter())
         .map(|(out_row, y)| {
-            let mut local_hist = [0u32; 256];
-            for (out_x, x) in (0..width & !1).step_by(2).enumerate() {
-                let p1 = source_pixels[(y * width + x) as usize] as u16;
-                let p2 = source_pixels[(y * width + x + 1) as usize] as u16;
-                let p3 = source_pixels[((y + 1) * width + x) as usize] as u16;
-                let p4 = source_pixels[((y + 1) * width + x + 1) as usize] as u16;
+            let row1 = &source_pixels[(y * width) as usize .. (y * width + width) as usize];
+            let row2 = &source_pixels[((y + 1) * width) as usize .. ((y + 1) * width + width) as usize];
 
-                let avg = ((p1 + p2 + p3 + p4) / 4) as u8;
-                out_row[out_x] = avg;
-                local_hist[avg as usize] += 1;
+            // Pass 1: SIMD-vectorizable binning (no scalar histogram branches)
+            for (out_x, (c1, c2)) in row1.chunks_exact(2).zip(row2.chunks_exact(2)).enumerate() {
+                let p1 = c1[0] as u16;
+                let p2 = c1[1] as u16;
+                let p3 = c2[0] as u16;
+                let p4 = c2[1] as u16;
+                out_row[out_x] = ((p1 + p2 + p3 + p4) / 4) as u8;
+            }
+
+            // Pass 2: Histogram accumulation
+            let mut local_hist = [0u32; 256];
+            for &pixel in &out_row[..new_width as usize] {
+                local_hist[pixel as usize] += 1;
             }
             local_hist
         })
@@ -93,10 +98,11 @@ fn apply_row_normalization(image: &GrayImage) -> GrayImage {
         let bias = 2.0;
         let adjust = (bias - row_dark_level).round() as i16;
 
-        let mut out_row = Vec::with_capacity(width as usize);
-        for &pixel in row_slice {
+        // SIMD-vectorizable add and clamp
+        let mut out_row = vec![0u8; width as usize];
+        for (out_p, &pixel) in out_row.iter_mut().zip(row_slice.iter()) {
             let adjusted = (pixel as i16) + adjust;
-            out_row.push(adjusted.clamp(0, 255) as u8);
+            *out_p = adjusted.clamp(0, 255) as u8;
         }
         out_row
     }).collect();

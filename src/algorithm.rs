@@ -350,15 +350,23 @@ fn scan_image_for_candidates(image: &GrayImage,
         let mut local_histogram = [0_u32; 256];
         let row_pixels: &[u8] = &image_pixels[rownum * width .. (rownum+1) * width];
 
-        // First pass: sample every cache line (64 bytes) to estimate row minimum.
-        let mut row_min = 255u8;
-        for i in (0..row_pixels.len()).step_by(64) {
-            row_min = row_min.min(row_pixels[i]);
+        // First pass: Find row minimum using SIMD-friendly chunk reduction
+        // By evaluating in chunks of 32, LLVM auto-vectorizes this into 
+        // 256-bit SIMD min operations.
+        let mut min_chunk = [255u8; 32];
+        for chunk in row_pixels.chunks_exact(32) {
+            for i in 0..32 {
+                min_chunk[i] = min_chunk[i].min(chunk[i]);
+            }
         }
+        let mut row_min = 255u8;
+        for &m in &min_chunk { row_min = row_min.min(m); }
+        for &p in row_pixels.chunks_exact(32).remainder() { row_min = row_min.min(p); }
         let threshold = row_min.saturating_add(sigma_noise_2 as u8 / 2);
 
         // Second pass: pixel loop, only create gates when needed.
         if compute_histogram {
+            // Must visit every pixel to update histogram.
             for center_x in 3..(row_pixels.len()-3) {
                 let center_pixel = row_pixels[center_x];
                 local_histogram[center_pixel as usize] += 1;
@@ -373,17 +381,38 @@ fn scan_image_for_candidates(image: &GrayImage,
                 }
             }
         } else {
-            // Identical except omits histogram update.
-            for center_x in 3..(row_pixels.len()-3) {
-                let center_pixel = row_pixels[center_x];
-                if center_pixel >= threshold {
-                    let gate = &row_pixels[center_x-3..center_x+4];
-                    let result_type = gate_star_1d(
-                        gate, sigma_noise_2, sigma_noise_3);
-                    if result_type == ResultType::Candidate {
-                        local_candidates.push(CandidateFrom1D{x: center_x as i32,
-                                                              y: rownum as i32});
+            // SIMD-optimized fast-forward scan (no histogram blocking vectorization)
+            let mut center_x = 3;
+            let end_x = row_pixels.len() - 3;
+            while center_x < end_x {
+                // Check 16 pixels at a time for ANY bright pixels.
+                if center_x + 16 <= end_x {
+                    let chunk = &row_pixels[center_x..center_x+16];
+                    let mut any_bright = false;
+                    for i in 0..16 {
+                        if chunk[i] >= threshold { any_bright = true; }
                     }
+                    if !any_bright {
+                        // Entire 16 pixel block is dark, skip forward
+                        center_x += 16;
+                        continue;
+                    }
+                }
+                
+                // Fallback to scalar gating if a bright pixel exists in this neighborhood
+                let limit = (center_x + 16).min(end_x);
+                while center_x < limit {
+                    let center_pixel = row_pixels[center_x];
+                    if center_pixel >= threshold {
+                        let gate = &row_pixels[center_x-3..center_x+4];
+                        let result_type = gate_star_1d(
+                            gate, sigma_noise_2, sigma_noise_3);
+                        if result_type == ResultType::Candidate {
+                            local_candidates.push(CandidateFrom1D{x: center_x as i32,
+                                                                  y: rownum as i32});
+                        }
+                    }
+                    center_x += 1;
                 }
             }
         }
